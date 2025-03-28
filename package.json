@@ -1,0 +1,33 @@
+{
+  "name": "mt_service",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "docker:build": "docker-compose build",
+    "docker:up": "docker-compose up",
+    "docker:down": "docker-compose down"
+  },
+  "keywords": [
+    "marine-traffic",
+    "vessel-data",
+    "scraper"
+  ],
+  "author": "",
+  "license": "ISC",
+  "description": "Marine Traffic vessel data service",
+  "dependencies": {
+    "express": "^4.21.2",
+    "playwright": "^1.51.1",
+    "puppeteer": "^24.4.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "redis": "^4.6.13",
+    "bull": "^4.12.2",
+    "ioredis": "^5.3.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
