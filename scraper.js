@@ -7,7 +7,7 @@ puppeteer.use(StealthPlugin());
 
 // Browser pool for reusing browser instances
 class BrowserPool {
-  constructor(maxSize = 8) { // Increased pool size for more parallel processing
+  constructor(maxSize = 1) { // Reduced to 1 browser per worker
     this.maxSize = maxSize;
     this.browsers = [];
     this.inUse = new Set();
@@ -54,7 +54,7 @@ class BrowserPool {
   }
 
   // Preload pages for a browser
-  async preloadPages(browser, pageCount = 3) { // Preload 3 pages per browser
+  async preloadPages(browser, pageCount = 1) { // Preload 1 page per browser
     if (!this.pages.has(browser)) {
       this.pages.set(browser, []);
       this.pageInUse.set(browser, new Set());
@@ -219,7 +219,7 @@ class BrowserPool {
 }
 
 // Create a global browser pool instance
-const browserPool = new BrowserPool(5); // Adjust pool size as needed
+const browserPool = new BrowserPool(1); // One browser per worker
 
 // Start a cleanup interval to close idle browsers
 setInterval(() => browserPool.cleanup(), 300000); // Check every 5 minutes
