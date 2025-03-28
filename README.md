@@ -1,126 +1,156 @@
-# Marine Traffic Distributed Scraping Service
+# Marine Traffic Vessel Data Service
 
-A distributed system for scraping Marine Traffic vessel data using multiple concurrent browsers and services.
+A web service that scrapes Marine Traffic data for specific map tiles and returns it as JSON. The service includes in-memory caching to improve performance and reduce the number of requests to Marine Traffic.
 
-## Architecture
+## Installation
 
-This service uses a distributed architecture with multiple components:
-
-1. **Orchestrator**: Manages the API endpoints and distributes scraping tasks to workers
-2. **Scrapers**: Multiple worker instances that perform the actual scraping
-3. **Redis**: Message broker and cache for coordinating between services
-
-```
-┌─────────────────┐     ┌─────────────────┐
-│                 │     │                 │
-│   Orchestrator  │◄────┤  API Requests   │
-│                 │     │                 │
-└────────┬────────┘     └─────────────────┘
-         │
-         │ (Redis Queue)
-         ▼
-┌─────────────────┐
-│                 │
-│  Redis Broker   │
-│                 │
-└─┬───────┬───────┘
-  │       │
-  │       │ (Task Distribution)
-  │       │
-  ▼       ▼
-┌─────┐ ┌─────┐
-│     │ │     │
-│Scraper│ │Scraper│ ... (Multiple Scraper Instances)
-│     │ │     │
-└─────┘ └─────┘
-```
-
-## Features
-
-- **Horizontal Scaling**: Add more scraper instances to increase throughput
-- **Task Queuing**: Prioritized task queue with automatic retries
-- **Distributed Caching**: Shared cache to avoid redundant scraping
-- **Fault Tolerance**: Automatic recovery from failures
-- **Browser Management**: Automatic browser health checks and restarts
-- **Monitoring**: Status endpoint for monitoring queue health
-
-## Configuration
-
-The system can be configured through environment variables:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `SERVICE_ROLE` | Role of the service (`orchestrator` or `scraper`) | `orchestrator` |
-| `HTTP_PORT` | Port for the HTTP server | `5090` |
-| `MEMORY_CACHE_TTL` | Cache TTL in seconds | `300` |
-| `MAX_CONCURRENT_JOBS` | Max concurrent jobs per scraper | `3` |
-| `BROWSER_RESTART_INTERVAL` | Browser restart interval in ms | `3600000` |
-| `JOB_TIMEOUT` | Job timeout in ms | `60000` |
-| `JOB_RETRY_DELAY` | Delay between retries in ms | `5000` |
-| `JOB_MAX_RETRIES` | Maximum number of retries | `3` |
-
-## API Endpoints
-
-### GET /vessels-on-map
-
-Returns vessel data for a specific tile.
-
-**Parameters:**
-- `z` (optional): Zoom level (default: 7)
-- `x` (optional): X coordinate (default: 73)
-- `y` (optional): Y coordinate (default: 50)
-
-### GET /traverse-tiles
-
-Starts a background task to traverse multiple tiles.
-
-**Parameters:**
-- `z` (optional): Zoom level (default: 7)
-- `startX` (optional): Starting X coordinate (default: 73)
-- `startY` (optional): Starting Y coordinate (default: 50)
-- `width` (optional): Width in tiles (default: 2)
-- `height` (optional): Height in tiles (default: 2)
-- `output` (optional): Output filename (default: vessel_data.json)
-
-### GET /traverse-all
-
-Starts a background task to traverse all tiles at the configured zoom level.
-
-**Parameters:**
-- `output` (optional): Output filename (default: vessel_data_z{zoom}_all.json)
-
-### GET /status
-
-Returns the status of the service, including queue statistics.
-
-## Deployment
-
-The service is deployed using Docker Compose:
+### Standard Installation
 
 ```bash
-# Build the Docker images
+# Install dependencies
+npm install
+
+# Start the service
+npm start
+```
+
+### Docker Installation
+
+```bash
+# Build the Docker image
 npm run docker:build
 
-# Start the services
+# Start the service with Docker
 npm run docker:up
 
-# Stop the services
+# Stop the service
 npm run docker:down
 ```
 
-## Scaling
+The service runs on port 3090 by default.
 
-To scale the number of scraper instances:
+## API Endpoints
 
-```bash
-docker-compose up -d --scale scraper=5
+### 1. Get Vessels on a Specific Map Tile
+
+```
+GET /vessels-on-map?z=14&x=9242&y=6324
 ```
 
-This will run 5 scraper instances in parallel, increasing the throughput of the system.
+Parameters:
+- `z`: Zoom level (default: 7)
+- `x`: X coordinate (default: 73)
+- `y`: Y coordinate (default: 50)
 
-## Performance Considerations
+This endpoint returns vessel data for a specific map tile.
 
-- Each scraper instance manages its own browser and can handle multiple concurrent pages
-- The browser is automatically restarted periodically to prevent memory leaks
-- Redis is used for both task queuing and result coordination
-- Prioritized queuing ensures interactive requests are handled before background tasks
+### 2. Traverse Multiple Tiles
+
+```
+GET /traverse-tiles?z=7&startX=73&startY=50&width=2&height=2&output=vessel_data.json
+```
+
+Parameters:
+- `z`: Zoom level (default: 7)
+- `startX`: Starting X coordinate (default: 73)
+- `startY`: Starting Y coordinate (default: 50)
+- `width`: Number of tiles to traverse horizontally (default: 2)
+- `height`: Number of tiles to traverse vertically (default: 2)
+- `output`: Output filename (default: 'vessel_data.json')
+
+This endpoint traverses multiple tiles and saves the data to a file.
+
+### 3. Traverse All Tiles at Zoom Level 3
+
+```
+GET /traverse-all
+```
+
+This endpoint traverses all tiles at zoom level 3 and returns the vessel data.
+
+## Example Response
+
+```json
+[
+  {
+    "mmsi": 123456789,
+    "timestamp": "1742815920426",
+    "speed": 9.6,
+    "cog": 65,
+    "heading": 67,
+    "lat": 37.97113,
+    "lng": 23.96323,
+    "a": 13,
+    "b": 13,
+    "c": 4,
+    "d": 4,
+    "reqts": "1742815921549",
+    "shiptype": 70,
+    "shipgroup": 70,
+    "iso2": "gr",
+    "country": null,
+    "name": "VESSEL NAME",
+    "destination": "PIRAEUS",
+    "_tileX": "9242",
+    "_tileY": "6324"
+  },
+  ...
+]
+```
+
+## How It Works
+
+The service uses puppeteer-stealth to navigate to specific tiles on Marine Traffic. It captures all XHR requests matching the pattern "station:0", extracts the vessel data from the responses, and returns the transformed vessel information as JSON.
+
+## Response Data Fields
+
+The vessel data includes the following fields:
+
+- `mmsi`: Maritime Mobile Service Identity (unique vessel identifier)
+- `timestamp`: Timestamp of the vessel's position
+- `speed`: Speed in knots (divided by 10 from the original value)
+- `cog`: Course over ground in degrees
+- `heading`: Heading in degrees (may be null)
+- `lat`: Latitude
+- `lng`: Longitude
+- `a`: Distance from bow to reference position in meters
+- `b`: Distance from reference position to stern in meters
+- `c`: Distance from port side to reference position in meters
+- `d`: Distance from reference position to starboard side in meters
+- `reqts`: Request timestamp
+- `shiptype`: Type of vessel (numeric code)
+- `shipgroup`: Ship group (same as shiptype)
+- `iso2`: Country flag code (lowercase)
+- `country`: Country name (may be null)
+- `name`: Name of the vessel
+- `destination`: Destination or "CLASS B" for AIS Class B vessels
+- `_tileX`: X coordinate of the tile this vessel was found in
+- `_tileY`: Y coordinate of the tile this vessel was found in
+
+## Environment Variables
+
+The service can be configured using the following environment variables:
+
+- `HTTP_PORT`: Port to run the service on (default: 3090)
+- `MEMORY_CACHE_TTL`: Time-to-live for in-memory cache in seconds (default: 300)
+
+## Docker Deployment
+
+The service includes Docker configuration files for easy deployment:
+
+- `Dockerfile`: Defines the Docker image
+- `docker-compose.yml`: Defines the Docker Compose configuration
+- `.dockerignore`: Defines files to exclude from the Docker image
+
+To deploy with Docker:
+
+```bash
+# Build and start the service
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+
+# Stop the service
+docker-compose down
+```

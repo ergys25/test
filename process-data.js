@@ -1,132 +1,212 @@
-// process-data.js
+const fs = require('fs');
+const path = require('path');
 
 /**
- * Determines the ship group based on ship type or MMSI.
- * If shipType is a valid number, it's used directly.
- * If shipType is invalid and MMSI starts with '99', group is 1.
- * Otherwise, the default group is 0.
- *
- * @param {string|number} mmsi - The vessel's MMSI.
- * @param {string|number} shipType - The vessel's ship type.
- * @returns {number} The determined ship group.
+ * Function to load the captured requests
+ * @param {string} tileDir - Directory containing the tile data (optional)
+ * @param {string} fileName - Name of the file to load (default: captured_requests.json)
+ * @returns {Array} The loaded data
  */
-function determineShipGroup(mmsi, shipType) {
-  // Convert shipType to number
-  const shipTypeNum = parseInt(shipType);
+function loadCapturedData(tileDir = '', fileName = 'captured_requests.json') {
+  try {
+    // If tileDir is provided, use it, otherwise look in the current directory
+    const filePath = tileDir ? path.join(tileDir, fileName) : fileName;
 
-  // If shipType is a valid number, return it as the shipgroup
-  if (!isNaN(shipTypeNum)) {
-    return shipTypeNum;
+    // Check if the file exists
+    if (!fs.existsSync(filePath)) {
+      console.error(`File not found: ${filePath}`);
+      return [];
+    }
+
+    const data = fs.readFileSync(filePath, 'utf8');
+    return JSON.parse(data);
+  } catch (error) {
+    console.error(`Error loading data from ${tileDir}/${fileName}:`, error);
+    return [];
   }
+}
 
-  // If shipType is not a valid number, check MMSI
-  // Ensure mmsi is treated as a string for startsWith check
-  if (mmsi && mmsi.toString().startsWith('99')) {
-    return 1;
-  }
-
-  // Default
-  return 0;
+// Function to extract URLs only
+function extractUrls(data) {
+  return data.map(item => item.request.url);
 }
 
 /**
- * Extracts and transforms vessel data from the raw scraped data array.
- *
- * @param {Array} rawData - The array of captured request/response objects from the scraper.
- * @param {number} tileX - The X coordinate of the tile (used as fallback).
- * @param {number} tileY - The Y coordinate of the tile (used as fallback).
- * @returns {Array} An array of formatted vessel data objects.
+ * Function to extract unique parameters from URLs
+ * @param {Array} data - The data to process
+ * @returns {Object} Object containing unique parameters and their values
  */
-function processScrapedData(rawData, tileX, tileY) {
-  const vesselsData = [];
+function extractUniqueParameters(data) {
+  const urls = extractUrls(data);
+  const allParams = {};
 
-  if (!Array.isArray(rawData)) {
-    console.error('Invalid rawData input to processScrapedData: Expected an array.');
-    return vesselsData; // Return empty array if input is invalid
-  }
-
-  rawData.forEach(item => {
-    // Ensure item and nested properties exist
-    if (item && item.response && item.response.data) {
-      const responseData = item.response.data;
-
-      // Check if the response structure matches expected vessel data format
-      if (responseData.type === 1 && responseData.data && Array.isArray(responseData.data.rows)) {
-        responseData.data.rows.forEach(vessel => {
-          // Basic validation for essential fields like SHIP_ID
-          if (!vessel || typeof vessel !== 'object' || !vessel.SHIP_ID) {
-            console.warn('Skipping invalid vessel entry:', vessel);
-            return; // Skip this vessel entry if essential data is missing
+  urls.forEach(url => {
+    try {
+      // Extract query parameters
+      const queryString = url.split('?')[1];
+      if (queryString) {
+        const params = new URLSearchParams(queryString);
+        params.forEach((value, key) => {
+          if (!allParams[key]) {
+            allParams[key] = new Set();
           }
-
-          const currentTime = Date.now();
-          // Ensure ELAPSED is treated safely, default to '0' if null/undefined
-          const elapsedMs = parseInt(vessel.ELAPSED || '0') * 1000;
-          const timestamp = (currentTime - elapsedMs).toString();
-
-          // Safely parse numbers, providing defaults or null
-          const mmsi = vessel.SHIP_ID ? parseInt(vessel.SHIP_ID) : null;
-          const speed = vessel.SPEED ? parseFloat(vessel.SPEED) / 10 : 0; // Default to 0 if SPEED is missing/invalid
-          const cog = vessel.COURSE ? parseFloat(vessel.COURSE) : null;
-          const heading = vessel.HEADING ? parseFloat(vessel.HEADING) : null;
-          const lat = vessel.LAT ? parseFloat(vessel.LAT) : null;
-          const lng = vessel.LON ? parseFloat(vessel.LON) : null;
-          const shiptype = vessel.SHIPTYPE ? parseInt(vessel.SHIPTYPE) : null;
-
-          // Calculate dimensions safely
-          const l_fore = vessel.L_FORE ? parseInt(vessel.L_FORE) : null;
-          const length = vessel.LENGTH ? parseInt(vessel.LENGTH) : null;
-          const w_left = vessel.W_LEFT ? parseInt(vessel.W_LEFT) : null;
-          const width = vessel.WIDTH ? parseInt(vessel.WIDTH) : null;
-
-          const a = l_fore;
-          const b = length !== null && l_fore !== null ? length - l_fore : null;
-          const c = w_left;
-          const d = width !== null && w_left !== null ? width - w_left : null;
-
-          // Extract tile info from URL if available, otherwise use fallback
-          const requestUrl = item.request?.url || '';
-          const tileXMatch = requestUrl.match(/X:(\d+)/);
-          const tileYMatch = requestUrl.match(/Y:(\d+)/);
-
-          const transformedVessel = {
-            mmsi: mmsi,
-            timestamp: timestamp,
-            speed: speed,
-            cog: cog,
-            heading: heading,
-            lat: lat,
-            lng: lng,
-            a: a,
-            b: b,
-            c: c,
-            d: d,
-            reqts: currentTime.toString(), // Timestamp of the request processing
-            shiptype: shiptype,
-            shipgroup: determineShipGroup(mmsi, shiptype), // Use parsed mmsi and shiptype
-            iso2: vessel.FLAG ? vessel.FLAG.toLowerCase() : null,
-            country: null, // Placeholder, original code didn't populate this
-            name: vessel.SHIPNAME || null,
-            destination: vessel.DESTINATION || null,
-            _tileX: tileXMatch ? tileXMatch[1] : tileX.toString(),
-            _tileY: tileYMatch ? tileYMatch[1] : tileY.toString()
-          };
-
-          // Only add vessel if MMSI and coordinates are valid
-          if (transformedVessel.mmsi !== null && transformedVessel.lat !== null && transformedVessel.lng !== null) {
-             vesselsData.push(transformedVessel);
-          } else {
-             console.warn('Skipping vessel due to missing MMSI or coordinates:', vessel.SHIP_ID);
-          }
+          allParams[key].add(value);
         });
       }
-    } else {
-       console.warn('Skipping item due to missing response or data structure:', item?.request?.url);
+
+      // Also extract path parameters from the URL format we're seeing
+      // Example: /getData/get_data_json_4/z:4/X:3/Y:3/station:0
+      const pathParts = url.split('/');
+      for (const part of pathParts) {
+        if (part.includes(':')) {
+          const [key, value] = part.split(':');
+          if (!allParams[key]) {
+            allParams[key] = new Set();
+          }
+          allParams[key].add(value);
+        }
+      }
+    } catch (error) {
+      console.error(`Error processing URL ${url}:`, error);
     }
   });
 
-  return vesselsData;
+  // Convert Sets to Arrays for easier reading
+  const result = {};
+  Object.keys(allParams).forEach(key => {
+    result[key] = Array.from(allParams[key]);
+  });
+
+  return result;
 }
 
-// Export the primary processing function
-module.exports = { processScrapedData };
+/**
+ * Function to export data to CSV
+ * @param {Array} data - The data to export
+ * @param {string} tileDir - Directory to save the CSV file (optional)
+ * @param {string} outputFileName - Name of the output file (default: requests.csv)
+ */
+function exportToCsv(data, tileDir = '', outputFileName = 'requests.csv') {
+  try {
+    // If tileDir is provided, use it, otherwise save in the current directory
+    const outputPath = tileDir ? path.join(tileDir, outputFileName) : outputFileName;
+
+    // Create CSV header
+    let csvContent = 'URL,Method,Status,Timestamp\n';
+
+    // Add each request as a row
+    data.forEach(item => {
+      const url = item.request.url.replace(/,/g, '%2C'); // Escape commas
+      const method = item.request.method;
+      const status = item.response?.status || 'N/A';
+      const timestamp = item.request.timestamp;
+
+      csvContent += `${url},${method},${status},${timestamp}\n`;
+    });
+
+    // Write to file
+    fs.writeFileSync(outputPath, csvContent);
+    console.log(`Data exported to ${outputPath}`);
+  } catch (error) {
+    console.error(`Error exporting to CSV:`, error);
+  }
+}
+
+/**
+ * Function to find the most recent tile directory
+ * @returns {string|null} Path to the most recent tile directory or null if none found
+ */
+function findMostRecentTileDir() {
+  try {
+    const tileDataDir = 'tile_data';
+
+    // Check if tile_data directory exists
+    if (!fs.existsSync(tileDataDir)) {
+      return null;
+    }
+
+    // Get all subdirectories in tile_data
+    const tileDirs = fs.readdirSync(tileDataDir, { withFileTypes: true })
+      .filter(dirent => dirent.isDirectory())
+      .map(dirent => path.join(tileDataDir, dirent.name));
+
+    if (tileDirs.length === 0) {
+      return null;
+    }
+
+    // Find the most recently modified directory
+    let mostRecent = tileDirs[0];
+    let mostRecentTime = fs.statSync(mostRecent).mtime.getTime();
+
+    for (let i = 1; i < tileDirs.length; i++) {
+      const dirTime = fs.statSync(tileDirs[i]).mtime.getTime();
+      if (dirTime > mostRecentTime) {
+        mostRecent = tileDirs[i];
+        mostRecentTime = dirTime;
+      }
+    }
+
+    return mostRecent;
+  } catch (error) {
+    console.error('Error finding most recent tile directory:', error);
+    return null;
+  }
+}
+
+/**
+ * Main function to process data
+ * @param {string} tileDir - Directory containing the tile data (optional)
+ */
+function processData(tileDir = '') {
+  // If no tileDir provided, try to find the most recent one
+  if (!tileDir) {
+    tileDir = findMostRecentTileDir();
+
+    if (tileDir) {
+      console.log(`Using most recent tile directory: ${tileDir}`);
+    } else {
+      console.log('No tile directory found, using current directory');
+    }
+  }
+
+  // Load the data
+  const data = loadCapturedData(tileDir);
+
+  if (data.length === 0) {
+    console.log('No data found or empty data file.');
+    return;
+  }
+
+  console.log(`Loaded ${data.length} captured requests.`);
+
+  // Export to CSV
+  exportToCsv(data, tileDir);
+
+  // Extract and display unique parameters
+  const uniqueParams = extractUniqueParameters(data);
+  console.log('\nUnique parameters found in URLs:');
+  console.log(JSON.stringify(uniqueParams, null, 2));
+
+  // Save unique parameters to a file
+  const uniqueParamsPath = tileDir ? path.join(tileDir, 'unique_parameters.json') : 'unique_parameters.json';
+  fs.writeFileSync(uniqueParamsPath, JSON.stringify(uniqueParams, null, 2));
+  console.log(`Unique parameters saved to ${uniqueParamsPath}`);
+}
+
+// Parse command line arguments
+function parseArgs() {
+  const args = process.argv.slice(2);
+  let tileDir = '';
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--dir' && i + 1 < args.length) {
+      tileDir = args[i + 1];
+    }
+  }
+
+  return { tileDir };
+}
+
+// Run the processing
+const { tileDir } = parseArgs();
+processData(tileDir);

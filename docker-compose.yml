@@ -1,55 +1,60 @@
 version: '3.8'
 
 services:
-  orchestrator:
+  # API service that handles HTTP requests
+  api:
     build: .
     ports:
       - "5090:5090"
     environment:
       - NODE_ENV=production
-      - MEMORY_CACHE_TTL=86400
+      - MEMORY_CACHE_TTL=300
       - HTTP_PORT=5090
-      - SERVICE_ROLE=orchestrator
-      - JOB_TIMEOUT=15000
-      - MAX_CONCURRENT_REQUESTS=50
-    restart: unless-stopped
-    depends_on:
-      - redis
-    networks:
-      - mt-network
-
-  scraper:
-    build: .
-    deploy:
-      replicas: 15
-    environment:
-      - NODE_ENV=production
-      - SERVICE_ROLE=scraper
       - REDIS_HOST=redis
-      - SCRAPE_TIMEOUT=15000
-      - MAX_CONCURRENT_JOBS=10
-      - PAGE_REUSE_COUNT=20
-      - MEMORY_LIMIT_MB=800
-    restart: unless-stopped
+      - REDIS_PORT=6379
+      - SERVICE_MODE=api
+      - WORKER_COUNT=12
     depends_on:
       - redis
-    networks:
-      - mt-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
 
+  # Redis for communication between API and workers
   redis:
     image: redis:alpine
     ports:
-      - "6667:6379"
+      - "6380:6379"
     volumes:
       - redis-data:/data
     restart: unless-stopped
-    command: redis-server --maxmemory 1gb --maxmemory-policy allkeys-lru
-    networks:
-      - mt-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
 
-networks:
-  mt-network:
-    driver: bridge
+  # Worker services using improved worker implementation
+  worker:
+    build: .
+    environment:
+      - NODE_ENV=production
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - SERVICE_MODE=worker
+    depends_on:
+      - redis
+    restart: unless-stopped
+    deploy:
+      mode: replicated
+      replicas: 12
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
 
 volumes:
   redis-data:

@@ -1,212 +1,296 @@
-// scraper-worker.js - Worker service for handling scraping tasks
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const { scrapeQueue, resultsQueue } = require('./queue.js');
-const { scrapeTile } = require('./scraper.js');
+/**
+ * Scraper Worker for Marine Traffic Service
+ *
+ * This module implements a worker that processes scraping requests from the queue.
+ * Each worker runs independently and can handle one request at a time.
+ */
 
-// Apply stealth plugin
-puppeteer.use(StealthPlugin());
+const { scrapeMarineTraffic } = require('./scraper');
+const queue = require('./queue');
+const EventEmitter = require('events');
 
-// Configuration
-const config = {
-  // Scraping Configuration
-  SCRAPE_TIMEOUT: parseInt(process.env.SCRAPE_TIMEOUT || '15000'), // 15 seconds default timeout per tile
-  MAX_CONCURRENT_JOBS: parseInt(process.env.MAX_CONCURRENT_JOBS || '10'), // Maximum concurrent scraping jobs
-  BROWSER_RESTART_INTERVAL: parseInt(process.env.BROWSER_RESTART_INTERVAL || '3600000'), // Restart browser every hour
-  PAGE_REUSE_COUNT: parseInt(process.env.PAGE_REUSE_COUNT || '20'), // Reuse pages for this many requests before recycling
-  // Memory Management
-  MEMORY_MONITOR_INTERVAL: parseInt(process.env.MEMORY_MONITOR_INTERVAL || '300000'), // Check memory usage every 5 minutes
-  MEMORY_LIMIT_MB: parseInt(process.env.MEMORY_LIMIT_MB || '1000'), // Restart browser if memory exceeds this limit (MB)
-  // Puppeteer Launch Arguments
-  PUPPETEER_ARGS: [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-infobars',
-    '--window-position=0,0',
-    '--ignore-certificate-errors',
-    '--disable-dev-shm-usage',
-    '--disable-accelerated-2d-canvas',
-    '--no-first-run',
-    '--no-zygote',
-    '--disable-gpu',
-    '--disable-extensions',
-    '--disable-background-networking',
-    '--disable-default-apps',
-    '--disable-sync',
-    '--disable-translate',
-    '--hide-scrollbars',
-    '--metrics-recording-only',
-    '--mute-audio',
-    '--no-experiments',
-    '--safebrowsing-disable-auto-update',
-    '--js-flags=--expose-gc,--max-old-space-size=500',
-    '--disable-notifications',
-    '--disable-webgl',
-    '--blink-settings=imagesEnabled=false'
-  ]
-};
+class ScraperWorker extends EventEmitter {
+  constructor(workerId = null) {
+    super();
+    this.workerId = workerId || queue.registerWorker();
+    this.currentRequestId = null;
+    this.isRunning = false;
+    this.isStopping = false;
+    this.lastActivity = Date.now();
+    this.stats = {
+      requestsProcessed: 0,
+      requestsFailed: 0,
+      totalProcessingTime: 0
+    };
 
-// Global state
-let browserInstance = null;
-let isBrowserReady = false;
-let isShuttingDown = false;
-let browserStartTime = 0;
+    console.log(`Scraper worker ${this.workerId} initialized`);
+  }
 
-// Initialize browser
-async function initializeBrowser() {
-  if (browserInstance) return; // Already initialized
+  /**
+   * Start the worker
+   */
+  start() {
+    if (this.isRunning) {
+      console.log(`Worker ${this.workerId} is already running`);
+      return;
+    }
 
-  console.log('Initializing Puppeteer browser instance...');
-  try {
-    browserInstance = await puppeteer.launch({
-      headless: 'new',
-      args: config.PUPPETEER_ARGS
-    });
+    this.isRunning = true;
+    this.isStopping = false;
+    console.log(`Worker ${this.workerId} started`);
 
-    isBrowserReady = true;
-    browserStartTime = Date.now();
-    console.log('Puppeteer browser instance initialized successfully.');
+    // Start processing requests
+    this.processNextRequest();
+  }
 
-    browserInstance.on('disconnected', () => {
-      console.error('Puppeteer browser disconnected unexpectedly!');
-      isBrowserReady = false;
-      browserInstance = null;
+  /**
+   * Stop the worker
+   * @param {boolean} immediate - Whether to stop immediately or after current request
+   */
+  stop(immediate = false) {
+    if (!this.isRunning) {
+      console.log(`Worker ${this.workerId} is not running`);
+      return;
+    }
 
-      if (!isShuttingDown) {
-        console.log('Attempting to relaunch browser...');
-        initializeBrowser().catch(err => console.error('Failed to relaunch browser:', err));
+    this.isStopping = true;
+    console.log(`Worker ${this.workerId} stopping (immediate: ${immediate})`);
+
+    if (immediate && this.currentRequestId) {
+      // Fail the current request
+      queue.failRequest(
+        this.currentRequestId,
+        this.workerId,
+        new Error('Worker stopped'),
+        true
+      );
+      this.currentRequestId = null;
+    }
+
+    if (!this.currentRequestId || immediate) {
+      this.isRunning = false;
+      this.isStopping = false;
+      console.log(`Worker ${this.workerId} stopped`);
+      this.emit('stopped');
+    }
+  }
+
+  /**
+   * Process the next request from the queue
+   */
+  processNextRequest() {
+    if (!this.isRunning || this.isStopping) {
+      return;
+    }
+
+    // Get the next request from the queue
+    const nextRequest = queue.getNextRequest(this.workerId);
+
+    if (!nextRequest) {
+      // No requests available, wait and try again
+      setTimeout(() => this.processNextRequest(), 1000);
+      return;
+    }
+
+    this.currentRequestId = nextRequest.requestId;
+    this.lastActivity = Date.now();
+
+    console.log(`Worker ${this.workerId} processing request ${this.currentRequestId}`);
+
+    // Process the request
+    this.processRequest(nextRequest.request)
+      .then(result => {
+        // Complete the request
+        queue.completeRequest(this.currentRequestId, this.workerId, result);
+
+        // Update stats
+        this.stats.requestsProcessed++;
+        this.stats.totalProcessingTime += Date.now() - this.lastActivity;
+
+        // Clear current request
+        this.currentRequestId = null;
+
+        // Check if we should stop
+        if (this.isStopping) {
+          this.isRunning = false;
+          this.isStopping = false;
+          console.log(`Worker ${this.workerId} stopped after completing request`);
+          this.emit('stopped');
+          return;
+        }
+
+        // Process next request
+        this.processNextRequest();
+      })
+      .catch(error => {
+        // Fail the request
+        queue.failRequest(this.currentRequestId, this.workerId, error, true);
+
+        // Update stats
+        this.stats.requestsFailed++;
+
+        // Clear current request
+        this.currentRequestId = null;
+
+        // Check if we should stop
+        if (this.isStopping) {
+          this.isRunning = false;
+          this.isStopping = false;
+          console.log(`Worker ${this.workerId} stopped after failing request`);
+          this.emit('stopped');
+          return;
+        }
+
+        // Process next request
+        this.processNextRequest();
+      });
+  }
+
+  /**
+   * Process a scraping request
+   * @param {Object} request - The request to process
+   * @returns {Promise<Object>} The result of the request
+   */
+  async processRequest(request) {
+    // Extract request parameters
+    const { z, x, y } = request;
+
+    console.log(`Worker ${this.workerId} scraping tile z=${z}, x=${x}, y=${y}`);
+
+    try {
+      // Call the scraper function
+      const result = await scrapeMarineTraffic(z, x, y);
+
+      // Check if the result is valid
+      if (!result || result.requestCount === 0) {
+        throw new Error('No data returned from scraper');
       }
-    });
 
-  } catch (error) {
-    console.error('Failed to initialize Puppeteer browser:', error);
-    isBrowserReady = false;
-    browserInstance = null;
-  }
-}
-
-// Check if browser needs to be restarted
-async function checkBrowserHealth() {
-  // If browser is not ready, initialize it
-  if (!isBrowserReady || !browserInstance) {
-    await initializeBrowser();
-    return;
-  }
-
-  // Check if browser needs to be restarted based on uptime
-  const uptime = Date.now() - browserStartTime;
-  if (uptime > config.BROWSER_RESTART_INTERVAL) {
-    console.log(`Browser uptime ${uptime}ms exceeds restart interval. Restarting browser...`);
-    try {
-      await browserInstance.close();
+      return result;
     } catch (error) {
-      console.error('Error closing browser for restart:', error);
-    }
-
-    browserInstance = null;
-    isBrowserReady = false;
-    await initializeBrowser();
-  }
-}
-
-// Process a scraping job
-async function processScrapeJob(job) {
-  const { z, x, y } = job.data;
-  console.log(`Processing scrape job: z=${z}, x=${x}, y=${y}, job ID: ${job.id}`);
-
-  // Check browser health before scraping
-  await checkBrowserHealth();
-
-  // If browser is still not ready, fail the job
-  if (!isBrowserReady || !browserInstance) {
-    console.error(`Browser not ready for job ${job.id}, z=${z}, x=${x}, y=${y}`);
-    throw new Error('Browser instance is not available.');
-  }
-
-  try {
-    // Perform the scraping
-    console.log(`Starting scrape for job ${job.id}, z=${z}, x=${x}, y=${y}`);
-    const rawData = await scrapeTile(browserInstance, z, x, y, config.SCRAPE_TIMEOUT);
-    console.log(`Scrape completed for job ${job.id}, captured ${rawData.length} data points`);
-
-    // Process the data directly here instead of using the results queue
-    console.log(`Processing data for job ${job.id}`);
-    const { processScrapedData } = require('./process-data.js');
-    const vesselsData = processScrapedData(rawData, x, y);
-    console.log(`Processed ${vesselsData.length} vessels for job ${job.id}`);
-
-    // Also add to results queue for caching and background processing
-    console.log(`Adding results to queue for job ${job.id}`);
-    const resultJob = await resultsQueue.add({
-      z, x, y,
-      rawData,
-      timestamp: Date.now()
-    });
-
-    console.log(`Results queued successfully for job ${job.id}, result job ID: ${resultJob.id}`);
-
-    // Return the actual vessel data instead of just metadata
-    return vesselsData;
-  } catch (error) {
-    console.error(`Error scraping tile z=${z}, x=${x}, y=${y}, job ID: ${job.id}:`, error);
-    throw error; // Let Bull handle retries
-  }
-}
-
-// Start the worker
-async function startWorker() {
-  console.log(`Starting scraper worker with concurrency: ${config.MAX_CONCURRENT_JOBS}`);
-
-  // Initialize browser
-  await initializeBrowser();
-
-  // Process jobs from the queue
-  scrapeQueue.process(config.MAX_CONCURRENT_JOBS, processScrapeJob);
-
-  console.log('Scraper worker started successfully.');
-
-  // Set up graceful shutdown
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-}
-
-// Graceful shutdown
-async function shutdown() {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
-
-  console.log('Shutting down scraper worker...');
-
-  // Stop processing new jobs
-  await scrapeQueue.pause();
-
-  // Close browser
-  if (browserInstance) {
-    try {
-      await browserInstance.close();
-      console.log('Browser closed successfully.');
-    } catch (error) {
-      console.error('Error closing browser:', error);
+      console.error(`Worker ${this.workerId} error scraping tile z=${z}, x=${x}, y=${y}:`, error);
+      throw error;
     }
   }
 
-  // Close queues
-  await scrapeQueue.close();
-  await resultsQueue.close();
-
-  console.log('Scraper worker shutdown complete.');
-  process.exit(0);
+  /**
+   * Get the worker's current status
+   * @returns {Object} The worker status
+   */
+  getStatus() {
+    return {
+      workerId: this.workerId,
+      isRunning: this.isRunning,
+      isStopping: this.isStopping,
+      currentRequestId: this.currentRequestId,
+      lastActivity: this.lastActivity,
+      stats: this.stats
+    };
+  }
 }
 
-// Start the worker if this is the main module
-if (require.main === module) {
-  startWorker().catch(error => {
-    console.error('Failed to start scraper worker:', error);
-    process.exit(1);
-  });
+/**
+ * Worker Pool for managing multiple scraper workers
+ */
+class WorkerPool extends EventEmitter {
+  constructor(size = 12) {
+    super();
+    this.size = size;
+    this.workers = new Map();
+    this.isRunning = false;
+  }
+
+  /**
+   * Start the worker pool
+   */
+  start() {
+    if (this.isRunning) {
+      console.log('Worker pool is already running');
+      return;
+    }
+
+    console.log(`Starting worker pool with ${this.size} workers`);
+
+    // Create and start workers
+    for (let i = 1; i <= this.size; i++) {
+      const worker = new ScraperWorker();
+      this.workers.set(worker.workerId, worker);
+
+      // Listen for worker events
+      worker.on('stopped', () => {
+        this.handleWorkerStopped(worker.workerId);
+      });
+
+      // Start the worker
+      worker.start();
+    }
+
+    this.isRunning = true;
+    console.log('Worker pool started');
+    this.emit('started');
+  }
+
+  /**
+   * Stop the worker pool
+   * @param {boolean} immediate - Whether to stop immediately or after current requests
+   */
+  stop(immediate = false) {
+    if (!this.isRunning) {
+      console.log('Worker pool is not running');
+      return;
+    }
+
+    console.log(`Stopping worker pool (immediate: ${immediate})`);
+
+    // Stop all workers
+    for (const worker of this.workers.values()) {
+      worker.stop(immediate);
+    }
+
+    // If immediate, mark as stopped now
+    if (immediate) {
+      this.isRunning = false;
+      this.workers.clear();
+      console.log('Worker pool stopped immediately');
+      this.emit('stopped');
+    }
+  }
+
+  /**
+   * Handle a worker stopping
+   * @param {number} workerId - The worker ID
+   */
+  handleWorkerStopped(workerId) {
+    // Remove the worker from the pool
+    this.workers.delete(workerId);
+
+    // Check if all workers have stopped
+    if (this.workers.size === 0) {
+      this.isRunning = false;
+      console.log('All workers stopped, worker pool is now stopped');
+      this.emit('stopped');
+    }
+  }
+
+  /**
+   * Get the worker pool status
+   * @returns {Object} The worker pool status
+   */
+  getStatus() {
+    return {
+      size: this.size,
+      activeWorkers: this.workers.size,
+      isRunning: this.isRunning,
+      workers: Array.from(this.workers.values()).map(worker => worker.getStatus())
+    };
+  }
 }
+
+// Create a singleton instance of the worker pool
+const workerPool = new WorkerPool();
 
 module.exports = {
-  startWorker,
-  shutdown
+  ScraperWorker,
+  WorkerPool,
+  workerPool
 };
