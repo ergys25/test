@@ -6,7 +6,7 @@ services:
   api:
     build: .
     ports:
-      - "5090:5090"
+      - "5032:5090"
     environment:
       - NODE_ENV=production
       - MEMORY_CACHE_TTL=300
@@ -61,7 +61,7 @@ services:
     restart: unless-stopped
     deploy:
       mode: replicated
-      replicas: 6  # Reduced from 12 to 6 to lower resource usage
+      replicas: 12  # Reduced from 12 to 6 to lower resource usage
       resources:
         limits:
           cpus: '1'

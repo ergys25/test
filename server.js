@@ -36,9 +36,7 @@ const config = {
   CACHE_WARMING_ENABLED: process.env.CACHE_WARMING_ENABLED !== 'false', // Enable by default
   CACHE_WARMING_INTERVAL: parseInt(process.env.CACHE_WARMING_INTERVAL || '3600000'), // 1 hour
   POPULAR_TILES: process.env.POPULAR_TILES ? JSON.parse(process.env.POPULAR_TILES) : [
-    { z: 11, x: 1153, y: 789 },
-    { z: 3, x: 5, y: 1 },
-    { z: 3, x: 2, y: 1 },
+  
 
   ]
 };
