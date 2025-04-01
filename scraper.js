@@ -405,7 +405,7 @@ async function scrapeMarineTraffic(z, x, y) {
     // Calculate coordinates
     const lon = (x / Math.pow(2, z) * 360 - 180).toFixed(6);
     const lat = ((Math.atan(Math.sinh(Math.PI * (1 - 2 * y / Math.pow(2, z)))) * 180) / Math.PI).toFixed(6);
-    const url = `https://www.marinetraffic.com/en/ais/home/centerx:${lon}/centery:${lat}/zoom:${z}`;
+    const url = `https://www.marinetraffic.com/en/ais/home/centerx:${lon}/centery:${lat}/zoom:${z+1}`;
 
     console.log(`Navigating to Marine Traffic for tile z=${z}, x=${x}, y=${y}...`);
 
