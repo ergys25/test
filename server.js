@@ -36,9 +36,10 @@ const config = {
   CACHE_WARMING_ENABLED: process.env.CACHE_WARMING_ENABLED !== 'false', // Enable by default
   CACHE_WARMING_INTERVAL: parseInt(process.env.CACHE_WARMING_INTERVAL || '3600000'), // 1 hour
   POPULAR_TILES: process.env.POPULAR_TILES ? JSON.parse(process.env.POPULAR_TILES) : [
-    { z: 7, x: 73, y: 50 }, // Default popular tile
-    { z: 8, x: 146, y: 100 }, // Another example
-    { z: 6, x: 36, y: 25 } // Another example
+    { z: 11, x: 1153, y: 789 },
+    { z: 3, x: 5, y: 1 },
+    { z: 3, x: 2, y: 1 },
+
   ]
 };
 
@@ -76,17 +77,31 @@ if (config.SERVICE_MODE === 'api' && process.env.LOCAL_WORKERS === 'true') {
 }
 
 // Handle graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully');
-  await cleanup();
-  process.exit(0);
-});
+const shutdownGracefully = async (signal) => {
+  console.log(`${signal} received, shutting down gracefully`);
 
-process.on('SIGINT', async () => {
-  console.log('SIGINT received, shutting down gracefully');
-  await cleanup();
-  process.exit(0);
-});
+  // Set a timeout to force exit if graceful shutdown takes too long
+  const forceExitTimeout = setTimeout(() => {
+    console.error(`Graceful shutdown timed out after 25 seconds, forcing exit`);
+    process.exit(1);
+  }, 25000); // 25 seconds timeout (slightly less than the 30s stop_grace_period)
+
+  try {
+    await cleanup();
+
+    // Clear the timeout and exit normally
+    clearTimeout(forceExitTimeout);
+    console.log('API server shutdown complete');
+    process.exit(0);
+  } catch (error) {
+    console.error(`Error during graceful shutdown:`, error);
+    clearTimeout(forceExitTimeout);
+    process.exit(1);
+  }
+};
+
+process.on('SIGTERM', () => shutdownGracefully('SIGTERM'));
+process.on('SIGINT', () => shutdownGracefully('SIGINT'));
 
 /**
  * Cleanup function for graceful shutdown
@@ -397,8 +412,8 @@ const queueScrapeRequest = (z, x, y, priority = 0) => {
 /**
  * Extract vessel data from raw response data
  */
-function extractVesselData(data, tileX, tileY) {
-  const vesselsData = [];
+function extractVesselData(data, tileX, tileY, z) {
+  const vesselsMap = new Map();
 
   // Check if data is available
   if (!data) {
@@ -423,8 +438,14 @@ function extractVesselData(data, tileX, tileY) {
           const elapsedMs = parseInt(vessel.ELAPSED || '0') * 1000;
           const timestamp = (currentTime - elapsedMs).toString();
 
+          // Log if this is a station 0 request
+          if (item.request && item.request.url && item.request.url.includes('station=0')) {
+            console.log(`Found station 0 request: ${item.request.url}`);
+          }
+
+          const mt_id = vessel.SHIP_ID ? parseInt(vessel.SHIP_ID) : null;
           const transformedVessel = {
-            mmsi: vessel.SHIP_ID ? parseInt(vessel.SHIP_ID) : null,
+            mt_id: mt_id,
             timestamp: timestamp,
             speed: vessel.SPEED ? parseFloat(vessel.SPEED) / 10 : 0, // Convert speed to knots (divide by 10)
             cog: vessel.COURSE ? parseFloat(vessel.COURSE) : null,
@@ -443,16 +464,46 @@ function extractVesselData(data, tileX, tileY) {
             name: vessel.SHIPNAME || null,
             destination: vessel.DESTINATION || null,
             _tileX: (item.request && item.request.url && item.request.url.match(/X:(\d+)/)?.[1]) || tileX.toString(),
-            _tileY: (item.request && item.request.url && item.request.url.match(/Y:(\d+)/)?.[1]) || tileY.toString()
+            _tileY: (item.request && item.request.url && item.request.url.match(/Y:(\d+)/)?.[1]) || tileY.toString(),
+            _zoom: z.toString(),
+            zoom: z // Add zoom to main response object
           };
 
-          vesselsData.push(transformedVessel);
+          // Only add vessel if it's not already in the map or if this is a newer position
+          if (!vesselsMap.has(mt_id) ||
+              vesselsMap.get(mt_id).timestamp < transformedVessel.timestamp) {
+            vesselsMap.set(mt_id, transformedVessel);
+          }
         });
       }
     }
   });
 
-  return vesselsData;
+  // Convert Map values to array before returning
+  return Array.from(vesselsMap.values());
+}
+
+/**
+ * Deduplicate vessels by MMSI
+ * @param {Array} vessels - Array of vessel objects
+ * @returns {Array} - Deduplicated array of vessel objects
+ */
+function deduplicateVessels(vessels) {
+  // Use a Map to deduplicate vessels by MMSI
+  const vesselsMap = new Map();
+
+  vessels.forEach(vessel => {
+    const mmsi = vessel.mmsi || vessel.mt_id; // Use MMSI or mt_id as the key
+
+    // Only add vessel if it's not already in the map or if this is a newer position
+    if (!vesselsMap.has(mmsi) ||
+        vesselsMap.get(mmsi).timestamp < vessel.timestamp) {
+      vesselsMap.set(mmsi, vessel);
+    }
+  });
+
+  // Convert Map values to array before returning
+  return Array.from(vesselsMap.values());
 }
 
 /**
@@ -494,7 +545,10 @@ app.get('/vessels-on-map', async (req, res) => {
     if (isFresh && !forceRefresh) {
       const responseTime = Date.now() - startTime;
       console.log(`Memory cache hit for ${cacheKey}, returned in ${responseTime}ms`);
-      return res.json(cacheEntry.data);
+
+      // Deduplicate vessels before returning
+      const dedupedData = deduplicateVessels(cacheEntry.data);
+      return res.json(dedupedData);
     }
 
     // If we have stale data, return it immediately and refresh in background
@@ -509,8 +563,10 @@ app.get('/vessels-on-map', async (req, res) => {
       // Refresh in background
       refreshCacheInBackground(z, x, y, priority);
 
+      // Deduplicate vessels before returning
+      const dedupedData = deduplicateVessels(cacheEntry.data);
       return res.json({
-        data: cacheEntry.data,
+        data: dedupedData,
         stale: true
       });
     }
@@ -523,11 +579,14 @@ app.get('/vessels-on-map', async (req, res) => {
       const data = await queueScrapeRequest(z, x, y, priority);
 
       // Extract vessel data
-      const vesselsData = extractVesselData(data, x, y);
+      const vesselsData = extractVesselData(data, x, y, z);
+
+      // Deduplicate vessels before storing in cache
+      const dedupedVessels = deduplicateVessels(vesselsData);
 
       // Store in memory cache with TTL from config
       memoryCache[cacheKey] = {
-        data: vesselsData,
+        data: dedupedVessels,
         expires: now + (config.MEMORY_CACHE_TTL * 1000), // Convert seconds to milliseconds
         refreshing: false
       };
@@ -535,8 +594,9 @@ app.get('/vessels-on-map', async (req, res) => {
       const responseTime = Date.now() - startTime;
       console.log(`Cached data for ${cacheKey} with TTL ${config.MEMORY_CACHE_TTL}s (${vesselsData.length} vessels), returned in ${responseTime}ms`);
 
-      // Return the vessel data
-      return res.json(vesselsData);
+      // Deduplicate vessels before returning
+      const dedupedData = deduplicateVessels(vesselsData);
+      return res.json(dedupedData);
     } catch (error) {
       console.error(`Error scraping data for tile z=${z}, x=${x}, y=${y}:`, error);
 
@@ -548,8 +608,11 @@ app.get('/vessels-on-map', async (req, res) => {
       // Check if we have stale cache data we can return
       if (cacheEntry && cacheEntry.data && cacheEntry.data.length > 0) {
         console.log(`Returning stale cache data for ${cacheKey} after error`);
+
+        // Deduplicate vessels before returning
+        const dedupedData = deduplicateVessels(cacheEntry.data);
         return res.json({
-          data: cacheEntry.data,
+          data: dedupedData,
           stale: true,
           error: error.message
         });
@@ -580,11 +643,14 @@ async function refreshCacheInBackground(z, x, y, priority) {
     const data = await queueScrapeRequest(z, x, y, Math.max(0, priority - 2));
 
     // Extract vessel data
-    const vesselsData = extractVesselData(data, x, y);
+    const vesselsData = extractVesselData(data, x, y, z);
+
+    // Deduplicate vessels before storing in cache
+    const dedupedVessels = deduplicateVessels(vesselsData);
 
     // Store in memory cache with TTL from config
     memoryCache[cacheKey] = {
-      data: vesselsData,
+      data: dedupedVessels,
       expires: Date.now() + (config.MEMORY_CACHE_TTL * 1000), // Convert seconds to milliseconds
       refreshing: false
     };
@@ -709,11 +775,14 @@ async function processTilesInBackground(z, startX, startY, width, height, output
           const data = await queueScrapeRequest(z, x, y, priority);
 
           // Extract vessel data
-          vesselsData = extractVesselData(data, x, y);
+          vesselsData = extractVesselData(data, x, y, z);
+
+          // Deduplicate vessels before storing in cache
+          const dedupedVessels = deduplicateVessels(vesselsData);
 
           // Store in memory cache
           memoryCache[cacheKey] = {
-            data: vesselsData,
+            data: dedupedVessels,
             expires: Date.now() + (config.MEMORY_CACHE_TTL * 1000) // Convert seconds to milliseconds
           };
 
@@ -729,17 +798,19 @@ async function processTilesInBackground(z, startX, startY, width, height, output
       // Wait for all batch promises to resolve
       const batchResults = await Promise.all(batchPromises);
 
-      // Add unique vessels to the result
+      // Collect all vessels from batch results
+      let allBatchVessels = [];
       batchResults.forEach(vesselsData => {
         if (vesselsData && vesselsData.length > 0) {
-          vesselsData.forEach(vessel => {
-            if (vessel.mmsi && !uniqueVesselIds.has(vessel.mmsi)) {
-              uniqueVesselIds.add(vessel.mmsi);
-              allVesselsData.push(vessel);
-            }
-          });
+          allBatchVessels = allBatchVessels.concat(vesselsData);
         }
       });
+
+      // Deduplicate vessels using our deduplication function
+      const dedupedBatchVessels = deduplicateVessels(allBatchVessels);
+
+      // Add to the overall results
+      allVesselsData = allVesselsData.concat(dedupedBatchVessels);
 
       console.log(`Processed batch ${Math.floor(i / BATCH_SIZE) + 1}, found ${allVesselsData.length} unique vessels so far`);
     }
@@ -857,6 +928,9 @@ async function traverseAllTiles() {
     // Set to track unique vessel IDs to avoid duplicates
     const uniqueVesselIds = new Set();
 
+    // Collect all vessels from all tiles
+    let allTilesVessels = [];
+
     // Process each tile in the grid
     for (let y = 0; y < totalTiles; y++) {
       for (let x = 0; x < totalTiles; x++) {
@@ -881,26 +955,24 @@ async function traverseAllTiles() {
             const data = await queueScrapeRequest(z, x, y, 10); // Higher priority for traverse-all
 
             // Extract vessel data
-            vesselsData = extractVesselData(data, x, y);
+            vesselsData = extractVesselData(data, x, y, z);
+
+            // Deduplicate vessels before storing in cache
+            const dedupedVessels = deduplicateVessels(vesselsData);
 
             // Store in memory cache with a longer TTL for zoom level 3
             const longerTTL = 3600; // 1 hour
             memoryCache[cacheKey] = {
-              data: vesselsData,
+              data: dedupedVessels,
               expires: Date.now() + (longerTTL * 1000) // Convert seconds to milliseconds
             };
 
             console.log(`Cached data for ${cacheKey} with TTL ${longerTTL}s (${vesselsData.length} vessels)`);
           }
 
-          // Add unique vessels to the result
+          // Add vessels to the collection
           if (vesselsData && vesselsData.length > 0) {
-            vesselsData.forEach(vessel => {
-              if (vessel.mmsi && !uniqueVesselIds.has(vessel.mmsi)) {
-                uniqueVesselIds.add(vessel.mmsi);
-                allVesselsData.push(vessel);
-              }
-            });
+            allTilesVessels = allTilesVessels.concat(vesselsData);
           }
 
           console.log(`Processed tile z=${z}, x=${x}, y=${y}, found ${vesselsData ? vesselsData.length : 0} vessels`);
@@ -915,10 +987,13 @@ async function traverseAllTiles() {
       }
     }
 
-    console.log(`Full tile traversal complete. Found ${allVesselsData.length} unique vessels across all tiles.`);
+    // Deduplicate all vessels using our deduplication function
+    const dedupedVessels = deduplicateVessels(allTilesVessels);
 
-    // Return the collected vessel data
-    return allVesselsData;
+    console.log(`Full tile traversal complete. Found ${dedupedVessels.length} unique vessels across all tiles.`);
+
+    // Return the deduplicated vessel data
+    return dedupedVessels;
 
   } catch (error) {
     console.error('Error in full tile traversal:', error);
@@ -967,11 +1042,14 @@ async function warmCache() {
         const data = await queueScrapeRequest(z, x, y, config.TASK_PRIORITY_LOW);
 
         // Extract vessel data
-        const vesselsData = extractVesselData(data, x, y);
+        const vesselsData = extractVesselData(data, x, y, z);
+
+        // Deduplicate vessels before storing in cache
+        const dedupedVessels = deduplicateVessels(vesselsData);
 
         // Store in memory cache with TTL from config
         memoryCache[cacheKey] = {
-          data: vesselsData,
+          data: dedupedVessels,
           expires: Date.now() + (config.MEMORY_CACHE_TTL * 1000),
           refreshing: false
         };

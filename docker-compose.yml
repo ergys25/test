@@ -1,4 +1,5 @@
-version: '3.8'
+# Docker Compose configuration for Marine Traffic Scraper
+# version field is obsolete in newer Docker Compose versions
 
 services:
   # API service that handles HTTP requests
@@ -13,15 +14,17 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - SERVICE_MODE=api
-      - WORKER_COUNT=12
+      - WORKER_COUNT=6  # Updated to match the number of worker replicas
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     deploy:
       resources:
         limits:
           cpus: '2'
           memory: 2G
+    stop_grace_period: 30s  # Allow time for graceful shutdown
 
   # Redis for communication between API and workers
   redis:
@@ -36,6 +39,13 @@ services:
         limits:
           cpus: '1'
           memory: 1G
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    stop_grace_period: 30s
 
   # Worker services using improved worker implementation
   worker:
@@ -46,15 +56,17 @@ services:
       - REDIS_PORT=6379
       - SERVICE_MODE=worker
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     deploy:
       mode: replicated
-      replicas: 12
+      replicas: 6  # Reduced from 12 to 6 to lower resource usage
       resources:
         limits:
           cpus: '1'
           memory: 1G
+    stop_grace_period: 30s  # Allow time for graceful shutdown
 
 volumes:
   redis-data:

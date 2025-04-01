@@ -32,27 +32,36 @@ if (config.SERVICE_MODE === 'worker') {
   const worker = new ImprovedWorker(config);
 
   // Handle graceful shutdown
-  process.on('SIGTERM', async () => {
-    console.log(`Worker ${config.WORKER_ID} received SIGTERM, shutting down gracefully`);
-    await worker.stop();
+  const shutdownGracefully = async (signal) => {
+    console.log(`Worker ${config.WORKER_ID} received ${signal}, shutting down gracefully`);
 
-    // Close all browser instances in the pool
-    console.log('Closing all browser instances in the pool');
-    await browserPool.closeAll();
+    // Set a timeout to force exit if graceful shutdown takes too long
+    const forceExitTimeout = setTimeout(() => {
+      console.error(`Graceful shutdown timed out after 25 seconds, forcing exit`);
+      process.exit(1);
+    }, 25000); // 25 seconds timeout (slightly less than the 30s stop_grace_period)
 
-    process.exit(0);
-  });
+    try {
+      // Stop the worker
+      await worker.stop();
 
-  process.on('SIGINT', async () => {
-    console.log(`Worker ${config.WORKER_ID} received SIGINT, shutting down gracefully`);
-    await worker.stop();
+      // Close all browser instances in the pool
+      console.log('Closing all browser instances in the pool');
+      await browserPool.closeAll();
 
-    // Close all browser instances in the pool
-    console.log('Closing all browser instances in the pool');
-    await browserPool.closeAll();
+      // Clear the timeout and exit normally
+      clearTimeout(forceExitTimeout);
+      console.log(`Worker ${config.WORKER_ID} shutdown complete`);
+      process.exit(0);
+    } catch (error) {
+      console.error(`Error during graceful shutdown:`, error);
+      clearTimeout(forceExitTimeout);
+      process.exit(1);
+    }
+  };
 
-    process.exit(0);
-  });
+  process.on('SIGTERM', () => shutdownGracefully('SIGTERM'));
+  process.on('SIGINT', () => shutdownGracefully('SIGINT'));
 
   // Start the worker
   worker.start().catch(error => {
