@@ -522,8 +522,9 @@ async function enrichVesselsWithDbData(vessels) {
   }
 
   try {
-    // Extract all ship_ids from the vessels
-    const shipIds = vessels.map(vessel => vessel.mt_id).filter(id => id !== null);
+    // Extract all ship_ids from the vessels and filter out null, undefined, and NaN values
+    const shipIds = vessels.map(vessel => vessel.mt_id)
+      .filter(id => id !== null && id !== undefined && !isNaN(id));
 
     if (shipIds.length === 0) {
       console.log('No valid ship IDs to query in the database');
