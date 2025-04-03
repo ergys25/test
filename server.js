@@ -512,6 +512,123 @@ function extractVesselData(data, tileX, tileY, z) {
 }
 
 /**
+ * Update vessel positions in the ais_map_latest table
+ * Only updates existing records and only when the timestamp is at least one hour old
+ * @param {Array} vessels - Array of vessel objects
+ * @returns {Promise<void>}
+ */
+async function updateVesselPositionsInDb(vessels) {
+  if (!vessels || vessels.length === 0) {
+    return;
+  }
+
+  try {
+    // Filter vessels that have mmsi, lat, and lng
+    const validVessels = vessels.filter(vessel =>
+      vessel.mmsi && vessel.lat && vessel.lng
+    );
+
+    if (validVessels.length === 0) {
+      console.log('No valid vessels to update positions');
+      return;
+    }
+
+    console.log(`Checking for position updates for ${validVessels.length} vessels in ais_map_latest table`);
+
+    // Get all MMSIs from the valid vessels
+    const mmsiValues = validVessels.map(vessel => vessel.mmsi);
+
+    // First, query to get existing records and their timestamps
+    const existingRecordsQuery = {
+      text: 'SELECT mmsi, ts FROM public.ais_map_latest WHERE mmsi = ANY($1)',
+      values: [mmsiValues]
+    };
+
+    const existingRecords = await pgPool.query(existingRecordsQuery);
+    console.log(`Found ${existingRecords.rows.length} existing records in ais_map_latest table`);
+
+    // Create a map of mmsi to existing timestamp
+    const existingTimestampsMap = new Map();
+    existingRecords.rows.forEach(row => {
+      existingTimestampsMap.set(row.mmsi, new Date(row.ts));
+    });
+
+    // Current time for comparison
+    const now = new Date();
+    const oneHourAgo = new Date(now.getTime() - (60 * 60 * 1000)); // 1 hour in milliseconds
+
+    // Filter vessels that need updates (existing and timestamp > 1 hour old)
+    const vesselsToUpdate = validVessels.filter(vessel => {
+      // Check if vessel exists in the database
+      if (!existingTimestampsMap.has(vessel.mmsi)) {
+        return false; // Skip vessels that don't exist in the database
+      }
+
+      // Get the existing timestamp
+      const existingTs = existingTimestampsMap.get(vessel.mmsi);
+
+      // Only update if the existing timestamp is more than 1 hour old
+      return existingTs < oneHourAgo;
+    });
+
+    if (vesselsToUpdate.length === 0) {
+      console.log('No vessels need position updates (all are recent or not in database)');
+      return;
+    }
+
+    console.log(`Updating positions for ${vesselsToUpdate.length} vessels with outdated timestamps`);
+
+    // Process vessels in batches to avoid overwhelming the database
+    const BATCH_SIZE = 100;
+
+    for (let i = 0; i < vesselsToUpdate.length; i += BATCH_SIZE) {
+      const batch = vesselsToUpdate.slice(i, Math.min(i + BATCH_SIZE, vesselsToUpdate.length));
+
+      // Create an array of promises for each vessel update
+      const updatePromises = batch.map(vessel => {
+        // Current timestamp for the update
+        const vesselTs = vessel.timestamp ? new Date(parseInt(vessel.timestamp)) : now;
+
+        // Update query - only update existing records
+        const query = {
+          text: `
+            UPDATE public.ais_map_latest
+            SET
+              lat = $2,
+              lon = $3,
+              ts = $4,
+              speed = $5,
+              cog = $6,
+              heading = $7,
+              inserted_ts = NOW()
+            WHERE mmsi = $1
+          `,
+          values: [
+            vessel.mmsi,
+            vessel.lat,
+            vessel.lng,
+            vesselTs.toISOString(),
+            vessel.speed || 0,
+            vessel.cog || 0,
+            vessel.heading || 0
+          ]
+        };
+
+        return pgPool.query(query);
+      });
+
+      // Execute all updates in the batch
+      await Promise.all(updatePromises);
+      console.log(`Updated positions for batch ${Math.floor(i / BATCH_SIZE) + 1} of ${Math.ceil(vesselsToUpdate.length / BATCH_SIZE)}`);
+    }
+
+    console.log(`Successfully updated positions for ${vesselsToUpdate.length} vessels in ais_map_latest table`);
+  } catch (error) {
+    console.error('Error updating vessel positions in database:', error);
+  }
+}
+
+/**
  * Enrich vessel data with IMO and MMSI from the database
  * @param {Array} vessels - Array of vessel objects
  * @returns {Promise<Array>} - Promise that resolves with enriched vessel array
@@ -637,6 +754,9 @@ app.get('/vessels-on-map', async (req, res) => {
       // Enrich with database data and filter out non-matching vessels
       const enrichedData = await enrichVesselsWithDbData(dedupedData);
 
+      // Update vessel positions in the database
+      await updateVesselPositionsInDb(enrichedData);
+
       return res.json(enrichedData);
     }
 
@@ -657,6 +777,9 @@ app.get('/vessels-on-map', async (req, res) => {
 
       // Enrich with database data and filter out non-matching vessels
       const enrichedData = await enrichVesselsWithDbData(dedupedData);
+
+      // Update vessel positions in the database
+      await updateVesselPositionsInDb(enrichedData);
 
       return res.json({
         data: enrichedData,
@@ -693,6 +816,9 @@ app.get('/vessels-on-map', async (req, res) => {
       // Enrich with database data and filter out non-matching vessels
       const enrichedData = await enrichVesselsWithDbData(dedupedData);
 
+      // Update vessel positions in the database
+      await updateVesselPositionsInDb(enrichedData);
+
       return res.json(enrichedData);
     } catch (error) {
       console.error(`Error scraping data for tile z=${z}, x=${x}, y=${y}:`, error);
@@ -711,6 +837,9 @@ app.get('/vessels-on-map', async (req, res) => {
 
         // Enrich with database data and filter out non-matching vessels
         const enrichedData = await enrichVesselsWithDbData(dedupedData);
+
+        // Update vessel positions in the database
+        await updateVesselPositionsInDb(enrichedData);
 
         return res.json({
           data: enrichedData,
@@ -751,6 +880,9 @@ async function refreshCacheInBackground(z, x, y, priority) {
 
     // Enrich with database data and filter out non-matching vessels
     const enrichedVessels = await enrichVesselsWithDbData(dedupedVessels);
+
+    // Update vessel positions in the database
+    await updateVesselPositionsInDb(enrichedVessels);
 
     // Store in memory cache with TTL from config
     memoryCache[cacheKey] = {
