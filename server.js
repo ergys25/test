@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const Redis = require('ioredis');
 const { v4: uuidv4 } = require('uuid');
+const { Pool } = require('pg');
 const ImprovedQueue = require('./improved-queue');
 const { ImprovedWorkerPool } = require('./improved-worker');
 const { browserPool } = require('./scraper'); // Import the browser pool
@@ -20,6 +21,13 @@ const config = {
   REDIS_HOST: process.env.REDIS_HOST || 'localhost',
   REDIS_PORT: parseInt(process.env.REDIS_PORT || '6379'),
 
+  // PostgreSQL Configuration
+  DB_HOST: process.env.DB_HOST || 'localhost',
+  DB_PORT: parseInt(process.env.DB_PORT || '5432'),
+  DB_NAME: process.env.DB_NAME || 'marine_traffic',
+  DB_USER: process.env.DB_USER || 'mt_user',
+  DB_PASSWORD: process.env.DB_PASSWORD || 'mt_password',
+
   // Task Configuration
   TASK_TIMEOUT: parseInt(process.env.TASK_TIMEOUT || '120000'), // 2 minutes (increased from 30 seconds)
   TASK_PRIORITY_HIGH: 10,
@@ -36,7 +44,7 @@ const config = {
   CACHE_WARMING_ENABLED: process.env.CACHE_WARMING_ENABLED !== 'false', // Enable by default
   CACHE_WARMING_INTERVAL: parseInt(process.env.CACHE_WARMING_INTERVAL || '3600000'), // 1 hour
   POPULAR_TILES: process.env.POPULAR_TILES ? JSON.parse(process.env.POPULAR_TILES) : [
-  
+
 
   ]
 };
@@ -44,6 +52,24 @@ const config = {
 // Create Express app
 const app = express();
 const PORT = process.env.PORT || config.HTTP_PORT;
+
+// Initialize PostgreSQL connection pool
+const pgPool = new Pool({
+  host: config.DB_HOST,
+  port: config.DB_PORT,
+  database: config.DB_NAME,
+  user: config.DB_USER,
+  password: config.DB_PASSWORD,
+});
+
+// Test database connection
+pgPool.query('SELECT NOW()', (err, res) => {
+  if (err) {
+    console.error('Error connecting to PostgreSQL database:', err);
+  } else {
+    console.log('Connected to PostgreSQL database');
+  }
+});
 
 // Initialize in-memory cache
 const memoryCache = {};
@@ -124,6 +150,10 @@ async function cleanup() {
   await subscriber.quit();
   await publisher.quit();
   await queue.close();
+
+  // Close PostgreSQL connection pool
+  console.log('Closing PostgreSQL connection pool');
+  await pgPool.end();
 
   console.log('Cleanup complete');
 }
@@ -482,6 +512,62 @@ function extractVesselData(data, tileX, tileY, z) {
 }
 
 /**
+ * Enrich vessel data with IMO and MMSI from the database
+ * @param {Array} vessels - Array of vessel objects
+ * @returns {Promise<Array>} - Promise that resolves with enriched vessel array
+ */
+async function enrichVesselsWithDbData(vessels) {
+  if (!vessels || vessels.length === 0) {
+    return [];
+  }
+
+  try {
+    // Extract all ship_ids from the vessels
+    const shipIds = vessels.map(vessel => vessel.mt_id).filter(id => id !== null);
+
+    if (shipIds.length === 0) {
+      console.log('No valid ship IDs to query in the database');
+      return vessels;
+    }
+
+    // Query the database for vessels with matching ship_ids
+    const query = {
+      text: 'SELECT ship_id, imo, mmsi FROM vessels WHERE ship_id = ANY($1)',
+      values: [shipIds]
+    };
+
+    const result = await pgPool.query(query);
+    console.log(`Found ${result.rows.length} matching vessels in the database`);
+
+    // Create a map of ship_id to database vessel data for quick lookup
+    const dbVesselsMap = new Map();
+    result.rows.forEach(row => {
+      dbVesselsMap.set(row.ship_id, {
+        imo: row.imo,
+        mmsi: row.mmsi
+      });
+    });
+
+    // Enrich vessels with database data and filter out non-matching vessels
+    const enrichedVessels = vessels.filter(vessel => {
+      if (vessel.mt_id && dbVesselsMap.has(vessel.mt_id)) {
+        const dbData = dbVesselsMap.get(vessel.mt_id);
+        vessel.imo = dbData.imo;
+        vessel.mmsi = dbData.mmsi;
+        return true;
+      }
+      return false;
+    });
+
+    console.log(`Filtered vessels from ${vessels.length} to ${enrichedVessels.length} after database matching`);
+    return enrichedVessels;
+  } catch (error) {
+    console.error('Error enriching vessels with database data:', error);
+    return vessels; // Return original vessels in case of error
+  }
+}
+
+/**
  * Deduplicate vessels by MMSI
  * @param {Array} vessels - Array of vessel objects
  * @returns {Array} - Deduplicated array of vessel objects
@@ -546,7 +632,11 @@ app.get('/vessels-on-map', async (req, res) => {
 
       // Deduplicate vessels before returning
       const dedupedData = deduplicateVessels(cacheEntry.data);
-      return res.json(dedupedData);
+
+      // Enrich with database data and filter out non-matching vessels
+      const enrichedData = await enrichVesselsWithDbData(dedupedData);
+
+      return res.json(enrichedData);
     }
 
     // If we have stale data, return it immediately and refresh in background
@@ -563,8 +653,12 @@ app.get('/vessels-on-map', async (req, res) => {
 
       // Deduplicate vessels before returning
       const dedupedData = deduplicateVessels(cacheEntry.data);
+
+      // Enrich with database data and filter out non-matching vessels
+      const enrichedData = await enrichVesselsWithDbData(dedupedData);
+
       return res.json({
-        data: dedupedData,
+        data: enrichedData,
         stale: true
       });
     }
@@ -594,7 +688,11 @@ app.get('/vessels-on-map', async (req, res) => {
 
       // Deduplicate vessels before returning
       const dedupedData = deduplicateVessels(vesselsData);
-      return res.json(dedupedData);
+
+      // Enrich with database data and filter out non-matching vessels
+      const enrichedData = await enrichVesselsWithDbData(dedupedData);
+
+      return res.json(enrichedData);
     } catch (error) {
       console.error(`Error scraping data for tile z=${z}, x=${x}, y=${y}:`, error);
 
@@ -609,8 +707,12 @@ app.get('/vessels-on-map', async (req, res) => {
 
         // Deduplicate vessels before returning
         const dedupedData = deduplicateVessels(cacheEntry.data);
+
+        // Enrich with database data and filter out non-matching vessels
+        const enrichedData = await enrichVesselsWithDbData(dedupedData);
+
         return res.json({
-          data: dedupedData,
+          data: enrichedData,
           stale: true,
           error: error.message
         });
@@ -646,9 +748,12 @@ async function refreshCacheInBackground(z, x, y, priority) {
     // Deduplicate vessels before storing in cache
     const dedupedVessels = deduplicateVessels(vesselsData);
 
+    // Enrich with database data and filter out non-matching vessels
+    const enrichedVessels = await enrichVesselsWithDbData(dedupedVessels);
+
     // Store in memory cache with TTL from config
     memoryCache[cacheKey] = {
-      data: dedupedVessels,
+      data: enrichedVessels, // Store the enriched data in cache
       expires: Date.now() + (config.MEMORY_CACHE_TTL * 1000), // Convert seconds to milliseconds
       refreshing: false
     };
@@ -1045,9 +1150,12 @@ async function warmCache() {
         // Deduplicate vessels before storing in cache
         const dedupedVessels = deduplicateVessels(vesselsData);
 
+        // Enrich with database data and filter out non-matching vessels
+        const enrichedVessels = await enrichVesselsWithDbData(dedupedVessels);
+
         // Store in memory cache with TTL from config
         memoryCache[cacheKey] = {
-          data: dedupedVessels,
+          data: enrichedVessels, // Store the enriched data in cache
           expires: Date.now() + (config.MEMORY_CACHE_TTL * 1000),
           refreshing: false
         };

@@ -15,6 +15,11 @@ services:
       - REDIS_PORT=6379
       - SERVICE_MODE=api
       - WORKER_COUNT=6  # Updated to match the number of worker replicas
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=marine_traffic
+      - DB_USER=mt_user
+      - DB_PASSWORD=mt_password
     depends_on:
       redis:
         condition: service_healthy
@@ -22,8 +27,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2'
-          memory: 2G
+          cpus: '8'
+          memory: 16G
     stop_grace_period: 30s  # Allow time for graceful shutdown
 
   # Redis for communication between API and workers
